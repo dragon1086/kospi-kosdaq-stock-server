@@ -897,6 +897,11 @@ class KRXAuthManager:
 
         except KRX2FARequiredError:
             raise
+        except (KRXBlockedError, KRX2FARequiredError):
+            # 재시도해도 소용없는 실패는 그대로 올려보낸다. 아래 except 가
+            # 이것들을 일반 KRXAuthError 로 감싸면 재시도 루프가 판별하지 못하고
+            # 제한 중에도 다시 두드리게 된다 — 실서버에서 그렇게 재현됐다.
+            raise
         except Exception as e:
             logger.error(f"카카오 로그인 실패: {e}")
             raise KRXAuthError(f"카카오 로그인 실패: {e}")
@@ -1118,6 +1123,11 @@ class KRXAuthManager:
             logger.info("KRX 직접 로그인 성공")
             return True
 
+        except (KRXBlockedError, KRX2FARequiredError):
+            # 재시도해도 소용없는 실패는 그대로 올려보낸다. 아래 except 가
+            # 이것들을 일반 KRXAuthError 로 감싸면 재시도 루프가 판별하지 못하고
+            # 제한 중에도 다시 두드리게 된다 — 실서버에서 그렇게 재현됐다.
+            raise
         except Exception as e:
             logger.error(f"KRX 직접 로그인 실패: {e}")
             raise KRXAuthError(f"KRX 직접 로그인 실패: {e}")
