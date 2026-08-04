@@ -1,6 +1,6 @@
 [project]
 name = "kospi-kosdaq-stock-server"
-version = "0.4.0"
+version = "0.4.1"
 description = "KOSPI/KOSDAQ Stock Data MCP Server with KRX Data Marketplace integration"
 readme = "README.md"
 requires-python = ">=3.10"

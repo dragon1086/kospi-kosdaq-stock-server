@@ -80,6 +80,21 @@ class KRXSessionExpiredError(KRXAuthError):
     pass
 
 
+class KRXBlockedError(KRXAuthError):
+    """KRX가 이 클라이언트의 접근을 차단했다.
+
+    로그인 실패와는 다르게 다뤄야 한다. 자격증명 문제가 아니므로 재시도해도
+    풀리지 않고, 오히려 재시도가 차단을 연장시킨다. 실제로 2026-08-04 오후
+    배치가 이 상태에서 265회를 두 시간 동안 재시도했고, 그동안 KRX 데이터를
+    한 건도 받지 못했다.
+
+    증상은 로그인 페이지 대신 에러 페이지가 오는 것이다. 그 페이지에는 로그인
+    iframe이 없으므로, 예전에는 "로그인 iframe을 찾을 수 없습니다"로만 보여
+    페이지 구조가 바뀐 것으로 오진하기 쉬웠다.
+    """
+    pass
+
+
 class KRXDataError(Exception):
     """데이터 조회 에러"""
     pass
@@ -136,6 +151,7 @@ class KRXAuthManager:
     COOKIE_PATH = Path.home() / ".krx_session.json"
     LEGACY_COOKIE_PATH = Path.home() / ".krx_cookies.json"  # 기존 쿠키 파일
     LOCK_PATH = Path.home() / ".krx_session.lock"  # 로그인 락 파일
+    BLOCK_PATH = Path.home() / ".krx_blocked"  # 차단 감지 시각 기록
     SESSION_TIMEOUT = timedelta(hours=4)  # 세션 타임아웃 (보수적 설정)
     SESSION_REFRESH_THRESHOLD = timedelta(hours=3)  # 이 시간 이후면 선제적 갱신
     VALIDATION_SKIP_THRESHOLD = timedelta(minutes=5)  # 이 시간 내 검증됐으면 재검증 생략
@@ -143,7 +159,30 @@ class KRXAuthManager:
     # Playwright 타임아웃 설정 (운영 안정성을 위해 충분히 길게)
     PAGE_LOAD_TIMEOUT = 60000  # 60초
     LOGIN_WAIT_TIMEOUT = 30000  # 30초
-    MAX_LOGIN_RETRIES = 5  # 로그인 재시도 횟수 (동시 로그인 경쟁 대응)
+    # 재시도는 "일시적 경쟁"에만 쓸모가 있다. 차단 상태에서는 시도 자체가
+    # 비용이고 차단을 연장시키므로 5회에서 2회로 줄인다. 경쟁은 파일 락이
+    # 이미 막고 있고, 남은 경쟁이라면 두 번이면 충분하다.
+    MAX_LOGIN_RETRIES = 2
+
+    # 차단이 확인되면 이 시간 동안 로그인을 아예 시도하지 않는다.
+    #
+    # 24시간인 이유는 KRX 안내문이 그렇게 말하기 때문이다: "해당 IP는 탐지일로부터
+    # 1일간 접속이 제한되며, 제한기간 경과 후 자동화 수단을 통한 비정상 대량 조회가
+    # 다시 탐지되는 경우 접속 제한이 재적용될 수 있습니다."
+    #
+    # 더 짧게 잡으면 제한이 아직 살아있는 동안 다시 두드리게 되고, 그 두드림이
+    # 곧 재탐지 사유가 되어 차단이 갱신된다. 짧은 쿨다운은 회복을 앞당기는 게
+    # 아니라 늦춘다.
+    BLOCK_COOLDOWN = timedelta(hours=24)
+
+    # 로그인 페이지 대신 이것이 오면 차단이다. KRX는 차단 시 200으로 에러
+    # 페이지를 주기도 하므로 상태 코드만으로는 판별할 수 없다.
+    BLOCK_MARKERS = (
+        "에러페이지",
+        "Service unavailable",
+        "temporary access instability",
+        "일시적인 접속 불안정",
+    )
     LOCK_WAIT_TIMEOUT = 120  # 락 대기 타임아웃 (초) - 로그인에 2분 이상 걸릴 수 있음
 
     def __init__(
@@ -351,6 +390,103 @@ class KRXAuthManager:
         if self._session:
             self._session.cookies.clear()
 
+    @classmethod
+    def _looks_blocked(cls, title: str, body: str) -> bool:
+        """로그인 페이지가 아니라 차단 페이지인가.
+
+        상태 코드로는 못 가른다. KRX는 차단 시 403을 주기도 하고 200에 에러
+        페이지 본문을 실어 주기도 한다. 그래서 내용으로 판별한다.
+        """
+        haystack = f"{title}\n{body}"
+        return any(marker in haystack for marker in cls.BLOCK_MARKERS)
+
+    def _mark_blocked(self, reason: str):
+        """차단 시각을 남겨 다음 프로세스도 알 수 있게 한다.
+
+        배치는 프로세스를 여러 번 띄우므로 메모리에만 두면 다음 프로세스가
+        다시 차단을 두드린다. 세션 파일과 같은 위치에 파일로 남긴다.
+        """
+        try:
+            self.BLOCK_PATH.write_text(
+                json.dumps(
+                    {"blocked_at": datetime.now().isoformat(), "reason": reason[:500]},
+                    ensure_ascii=False,
+                )
+            )
+            logger.error(
+                f"KRX 접근 차단 감지 — {self.BLOCK_COOLDOWN.total_seconds() / 60:.0f}분간 "
+                f"로그인을 시도하지 않는다: {reason[:200]}"
+            )
+        except Exception as e:
+            logger.warning(f"차단 기록 실패(무시): {e}")
+
+    def _blocked_until(self) -> Optional[datetime]:
+        """쿨다운이 남아 있으면 해제 시각, 아니면 None."""
+        try:
+            if not self.BLOCK_PATH.exists():
+                return None
+            blocked_at = datetime.fromisoformat(
+                json.loads(self.BLOCK_PATH.read_text())["blocked_at"]
+            )
+        except Exception:
+            # 읽을 수 없는 기록은 없는 것으로 본다 — 차단이 아닌데 막는 쪽이
+            # 차단인데 두드리는 쪽보다 낫다고 할 수 없다.
+            return None
+        until = blocked_at + self.BLOCK_COOLDOWN
+        return until if datetime.now() < until else None
+
+    def _clear_blocked(self):
+        try:
+            if self.BLOCK_PATH.exists():
+                self.BLOCK_PATH.unlink()
+                logger.info("KRX 차단 기록 해제")
+        except Exception as e:
+            logger.warning(f"차단 기록 삭제 실패(무시): {e}")
+
+    async def _require_login_iframe(self, page):
+        """로그인 iframe을 집되, 없으면 왜 없는지 먼저 밝힌다.
+
+        차단 페이지에도 iframe은 없다. 그래서 "iframe을 못 찾았다"만 남기면
+        차단과 페이지 구조 변경이 같은 메시지로 보이고, 실제로 그 때문에
+        2026-08-04 장애가 '카카오 로그인 구조 변경'으로 오진됐다.
+
+        아울러 `query_selector`는 기다리지 않는다. iframe이 늦게 주입되면
+        정상 페이지에서도 None이 나오므로, 짧게 기다려 본 뒤에 판정한다.
+        """
+        try:
+            await page.wait_for_selector("iframe", timeout=self.LOGIN_WAIT_TIMEOUT)
+        except Exception:
+            pass
+
+        iframe = await page.query_selector("iframe")
+        if iframe:
+            return iframe
+
+        try:
+            title = await page.title()
+        except Exception:
+            title = ""
+        try:
+            body = await page.inner_text("body")
+        except Exception:
+            body = ""
+
+        if self._looks_blocked(title, body):
+            reason = f"title={title!r} body={' '.join(body.split())[:200]!r}"
+            self._mark_blocked(reason)
+            raise KRXBlockedError(
+                "KRX가 이 IP의 접근을 제한했습니다(로그인 페이지 대신 이용 제한 안내). "
+                "KRX 안내에 따르면 탐지일로부터 1일간 제한되며, 제한 중 재시도가 "
+                "다시 탐지되면 제한이 재적용됩니다. 대량 조회가 필요하면 "
+                "KRX Open API(https://openapi.krx.co.kr) 등 공식 경로를 사용하세요. "
+                f"[{reason}]"
+            )
+
+        raise KRXAuthError(
+            f"로그인 iframe을 찾을 수 없습니다. (title={title!r}, "
+            f"body={' '.join(body.split())[:120]!r})"
+        )
+
     def _get_recent_business_day(self) -> str:
         """가장 최근 영업일 반환 (세션 검증용)"""
         kr_holidays = KR()
@@ -526,6 +662,18 @@ class KRXAuthManager:
                         logger.info("다른 프로세스가 로그인 완료 - 세션 유효")
                         return True
 
+                # 차단 쿨다운 확인 — 재시도가 차단을 연장시키므로 시도 자체를
+                # 건너뛴다. 세션 재사용 경로를 모두 지나온 뒤에 검사하는 이유는,
+                # 차단 중이라도 살아있는 세션이 있으면 그건 계속 써도 되기 때문이다.
+                blocked_until = self._blocked_until()
+                if blocked_until:
+                    remaining = (blocked_until - datetime.now()).total_seconds()
+                    raise KRXBlockedError(
+                        f"KRX 접근이 차단된 상태입니다. "
+                        f"{remaining / 60:.0f}분 뒤({blocked_until:%H:%M})에 다시 시도하세요. "
+                        f"차단 중 재시도는 차단을 연장시킵니다."
+                    )
+
                 # 세션 파일 정리 후 로그인
                 self._cleanup_session_files()
 
@@ -546,11 +694,17 @@ class KRXAuthManager:
                             else:
                                 result = loop.run_until_complete(self._login_async_kakao())
                             if result:
+                                # 들어왔다는 건 차단이 풀렸다는 뜻이다.
+                                self._clear_blocked()
                                 return True
                         finally:
                             loop.close()
                     except KRX2FARequiredError:
                         # 2FA 에러는 재시도해도 의미 없음 (카카오 로그인만 해당)
+                        raise
+                    except KRXBlockedError:
+                        # 차단은 자격증명 문제가 아니라 상대가 우리를 막은 것이다.
+                        # 더 두드려도 풀리지 않고 차단만 길어진다. 즉시 포기한다.
                         raise
                     except Exception as e:
                         last_error = e
@@ -611,9 +765,7 @@ class KRXAuthManager:
             await asyncio.sleep(2)
 
             # iframe에서 카카오 로그인 버튼 클릭
-            iframe = await page.query_selector('iframe')
-            if not iframe:
-                raise KRXAuthError("로그인 iframe을 찾을 수 없습니다.")
+            iframe = await self._require_login_iframe(page)
 
             frame = await iframe.content_frame()
             kakao_btn = await frame.wait_for_selector(
@@ -795,9 +947,7 @@ class KRXAuthManager:
             await asyncio.sleep(2)
 
             # iframe에서 로그인 폼 접근
-            iframe = await page.query_selector('iframe')
-            if not iframe:
-                raise KRXAuthError("로그인 iframe을 찾을 수 없습니다.")
+            iframe = await self._require_login_iframe(page)
 
             frame = await iframe.content_frame()
 
