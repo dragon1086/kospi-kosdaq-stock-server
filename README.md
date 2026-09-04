@@ -3,7 +3,7 @@
 # kospi-kosdaq-stock-server
 
 [![PyPI version](https://badge.fury.io/py/kospi-kosdaq-stock-server.svg)](https://badge.fury.io/py/kospi-kosdaq-stock-server)
-[![smithery badge](https://smithery.ai/badge/@dragon1086/kospi-kosdaq-stock-server)](https://smithery.ai/server/@dragon1086/kospi-kosdaq-stock-server)
+[![LightNow](https://lightnow.ai/badge/io.github.dragon1086/kospi-kosdaq-stock-server)](https://lightnow.ai/servers/io.github.dragon1086/kospi-kosdaq-stock-server)
 
 <a href="https://glama.ai/mcp/servers/i1judi5h55">
   <img width="380" height="200" src="https://glama.ai/mcp/servers/i1judi5h55/badge" />
