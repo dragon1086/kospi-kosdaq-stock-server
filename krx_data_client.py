@@ -14,6 +14,7 @@ KRX 직접 로그인 또는 카카오 SNS 로그인을 지원하며, 카카오 �
     KRX_PW: KRX 직접 로그인 비밀번호 (KRX_LOGIN_METHOD="krx" 일 때 필요, 기본값)
     KAKAO_ID: 카카오 아이디 (KRX_LOGIN_METHOD="kakao" 일 때 필요)
     KAKAO_PW: 카카오 비밀번호 (KRX_LOGIN_METHOD="kakao" 일 때 필요)
+    KRX_ALLOW_BROWSER_LOGIN: "0"이면 기존 유효 세션만 사용하고 브라우저 로그인 금지 (기본값: "1")
 
 사용법:
     from krx_data_client import KRXDataClient
@@ -635,6 +636,15 @@ class KRXAuthManager:
 
     def _login_with_lock(self, force: bool = False) -> bool:
         """파일 락을 사용한 로그인 (동시 로그인 방지)"""
+        # login() already tried cached-session reuse/validation. Scheduled
+        # noninteractive callers must not wait on a browser or another login's
+        # file lock. This does not disable 2FA or remove any session/lock file.
+        if os.environ.get("KRX_ALLOW_BROWSER_LOGIN", "1").strip() == "0":
+            raise KRXAuthError(
+                "KRX browser login is disabled (KRX_ALLOW_BROWSER_LOGIN=0); "
+                "no reusable valid session is available. Repair authentication "
+                "outside the noninteractive batch."
+            )
         # 락 파일 생성/열기
         self.LOCK_PATH.touch(exist_ok=True)
 
@@ -2412,17 +2422,41 @@ class KRXDataClient:
 # 싱글톤 클라이언트 (lazy initialization)
 _default_client: Optional[KRXDataClient] = None
 _last_session_check_time: Optional[datetime] = None
+# A failed constructor never populated the singleton, so every next ticker
+# restarted the full browser login/retry sequence. Bound that amplification in
+# this process; existing persistent IP-block handling remains authoritative.
+AUTH_FAILURE_COOLDOWN_SECONDS = 15 * 60
+_auth_failure_until = 0.0
 
 # 세션 검증 생략 임계값 (이 시간 내에 검증했으면 재검증 생략)
 FRESH_SESSION_THRESHOLD = timedelta(minutes=5)
 
 
 def _get_client() -> KRXDataClient:
-    """기본 클라이언트 반환 (lazy initialization)"""
-    global _default_client
+    """기본 클라이언트 반환; 인증 실패 후에는 일정 시간 빠르게 실패한다."""
+    global _default_client, _auth_failure_until
     if _default_client is None:
-        _default_client = KRXDataClient()
+        if time.monotonic() < _auth_failure_until:
+            raise KRXAuthError(
+                "KRX authentication initialization is in cooldown after a failure. "
+                "Retry after 15 minutes, or call clear_auth_failure_cooldown() "
+                "after repairing authentication."
+            )
+        try:
+            _default_client = KRXDataClient()
+        except KRXAuthError:
+            # Do not retain exception objects, browser references, credentials,
+            # or URLs in the negative cache. The first caller gets the cause.
+            _auth_failure_until = time.monotonic() + AUTH_FAILURE_COOLDOWN_SECONDS
+            raise
+        _auth_failure_until = 0.0
     return _default_client
+
+
+def clear_auth_failure_cooldown() -> None:
+    """Allow an explicit retry after auth repair; do not erase sessions/IP blocks."""
+    global _auth_failure_until
+    _auth_failure_until = 0.0
 
 
 def ensure_session_valid() -> bool:
